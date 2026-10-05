@@ -401,6 +401,87 @@ assert.match(
   "idle persisted custom context must enter live replacement history",
  );
 
+// Regression: the direct OpenAI HTTP fallback can build a stale input snapshot before
+// before_provider_request runs. The final hook must replace that input from the reconciled branch,
+// even when previous_response_id continuation is disabled.
+const directLiveSessionId = "direct-openai-custom-message-session";
+const directLiveModel = {
+  provider: "openai",
+  api: "openai-responses",
+  id: "gpt-5.4",
+  baseUrl: "https://api.openai.com/v1",
+  input: ["text"],
+};
+const directLiveModelKey = "openai:openai-responses:gpt-5.4";
+const directReplacementHistory = [{ type: "compaction", encrypted_content: "DIRECT_ENCRYPTED" }];
+const directLiveBranch = [
+  {
+    type: "compaction",
+    id: "direct-compaction",
+    details: {
+      remoteCompaction: {
+        version: 2,
+        provider: "openai-responses-compaction",
+        implementation: "responses_compaction_v2",
+        modelKey: directLiveModelKey,
+        replacementHistory: directReplacementHistory,
+      },
+    },
+  },
+  {
+    type: "custom_message",
+    id: "direct-idle-custom-result",
+    customType: "supervised-fork-result",
+    content: "LIVE_DIRECT_IDLE_CUSTOM_RESULT",
+    display: true,
+  },
+];
+const directContext = {
+  cwd: repoRoot,
+  model: directLiveModel,
+  hasUI: false,
+  ui: { notify() {} },
+  sessionManager: {
+    getSessionId: () => directLiveSessionId,
+    getBranch: () => directLiveBranch,
+  },
+};
+process.env.PI_OPENAI_SERVER_COMPACTION_PREVIOUS_RESPONSE_ID = "false";
+setRemoteCompactionState(directLiveSessionId, {
+  compactionEntryId: "direct-compaction",
+  modelKey: directLiveModelKey,
+  replacementHistory: directReplacementHistory,
+  explicitHistory: [{
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "STALE_REMOTE_HISTORY" }],
+  }],
+});
+const directPatchedPayload = await beforeProviderRequest(
+  {
+    payload: {
+      model: "gpt-5.4",
+      input: [{ type: "message", role: "user", content: "STALE_PRE_HOOK_INPUT" }],
+      previous_response_id: "STALE_PREVIOUS_RESPONSE_ID",
+    },
+  },
+  directContext,
+ );
+assert.match(JSON.stringify(directPatchedPayload?.input), /LIVE_DIRECT_IDLE_CUSTOM_RESULT/);
+assert.doesNotMatch(JSON.stringify(directPatchedPayload?.input), /STALE_REMOTE_HISTORY|STALE_PRE_HOOK_INPUT/);
+assert.equal(directPatchedPayload?.previous_response_id, undefined);
+const wsSelectedInput = selectInputItemsForContinuation({
+  context: { messages: [] },
+  model: { input: ["text"] },
+  session: { lastContextLength: 0 },
+  currentModelKey: directLiveModelKey,
+  remoteCompactionState: getRemoteCompactionState(directLiveSessionId),
+  previousResponseId: "STALE_PREVIOUS_RESPONSE_ID",
+});
+assert.match(JSON.stringify(wsSelectedInput), /LIVE_DIRECT_IDLE_CUSTOM_RESULT/);
+assert.doesNotMatch(JSON.stringify(wsSelectedInput), /STALE_REMOTE_HISTORY/);
+delete process.env.PI_OPENAI_SERVER_COMPACTION_PREVIOUS_RESPONSE_ID;
+
 // The pre-compaction hook must reconcile the same branch before creating a new history.
 setRemoteCompactionState(liveSessionId, {
   compactionEntryId: "live-compaction",

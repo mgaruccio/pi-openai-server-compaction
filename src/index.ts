@@ -367,12 +367,19 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
         ? continuation.responseId
         : undefined;
 
-    const payload = applyPayloadPatch({
+    const patchedPayload = applyPayloadPatch({
       payload: event.payload,
       model,
       cfg,
       previousResponseId,
     });
+    const payload =
+      remoteState !== undefined
+        ? applyRemoteHistoryPayloadPatch({
+            payload: patchedPayload,
+            explicitHistory: normalizeResponseItemsForPrompt(remoteState.explicitHistory, model) as unknown[],
+          })
+        : patchedPayload;
 
     const features = ["store=true", "context_management"];
     if (remoteState !== undefined) {
