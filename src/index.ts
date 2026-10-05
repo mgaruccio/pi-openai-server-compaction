@@ -32,6 +32,7 @@ import {
   messageToResponseItems,
   messagesToResponseItems,
   normalizeResponseItemsForPrompt,
+  branchEntryToContextMessage,
   reconstructRemoteCompactionStateFromBranch,
 } from "./remote-compaction.ts";
 import {
@@ -69,9 +70,10 @@ function getSessionId(ctx: SessionContextLike): string {
 }
 
 function getBranchMessages(branchEntries: BranchEntry[]): AgentMessage[] {
-  return branchEntries.flatMap((entry) =>
-    entry.type === "message" && entry.message ? [entry.message as AgentMessage] : [],
-  );
+  return branchEntries.flatMap((entry) => {
+    const message = branchEntryToContextMessage(entry);
+    return message ? [message] : [];
+  });
 }
 
 function getBranchMessageCount(branchEntries: BranchEntry[]): number {
@@ -98,20 +100,24 @@ function clearSessionRuntimeState(sessionId: string | undefined): void {
   clearResponsesRequestShapeState(sessionId);
 }
 
-function syncRemoteState(ctx: SessionContextLike): void {
-  const sessionId = getSessionId(ctx);
-  const branchEntries = ctx.sessionManager.getBranch() as Array<{
-    type: string;
-    id: string;
-    details?: unknown;
-    message?: AgentMessage;
-  }>;
-  const state = reconstructRemoteCompactionStateFromBranch({ branchEntries });
+function syncRemoteStateFromBranch(sessionId: string, branchEntries: BranchEntry[]): void {
+  const state = reconstructRemoteCompactionStateFromBranch({
+    branchEntries: branchEntries as Array<{
+      type: string;
+      id: string;
+      details?: unknown;
+      message?: AgentMessage;
+    }>,
+  });
   if (state) {
     setRemoteCompactionState(sessionId, state);
   } else {
     clearRemoteCompactionState(sessionId);
   }
+}
+
+function syncRemoteState(ctx: SessionContextLike): void {
+  syncRemoteStateFromBranch(getSessionId(ctx), ctx.sessionManager.getBranch());
 }
 
 function getMatchingRemoteState(
@@ -210,6 +216,9 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
     const tools = buildToolsPayload(pi.getAllTools(), pi.getActiveTools());
     const sessionId = getSessionId(ctx);
     const branchEntries = event.branchEntries as BranchEntry[];
+    // Reconcile the durable branch before compaction so idle pi.sendMessage() entries
+    // cannot be omitted from a newly stored replacement history.
+    syncRemoteStateFromBranch(sessionId, branchEntries);
     const remoteState = getMatchingRemoteState(sessionId, model);
     const observedRequestShape = getResponsesRequestShapeState(sessionId);
     const fullBranchMessages = getBranchMessages(branchEntries);
@@ -328,6 +337,9 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
       reasoning: extractResponsesReasoningConfig(event.payload),
       text: extractResponsesTextConfig(event.payload),
     });
+    // Persisted custom messages may be appended while Pi is idle without message_end.
+    // Reconcile the authoritative branch before replacing provider input.
+    syncRemoteState(ctx);
     const remoteState = getMatchingRemoteState(sessionId, model);
 
     if (isOpenAICodexResponsesModel(model)) {

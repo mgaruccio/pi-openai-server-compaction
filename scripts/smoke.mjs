@@ -101,6 +101,7 @@ const {
   buildRemoteCompactionRequestBody,
   buildRemoteCompactionV2History,
   extractRemoteCompactionDetails,
+  messageToResponseItems,
   normalizeResponseItemsForPrompt,
   parseRemoteCompactionV2Events,
   processCompactedHistory,
@@ -110,6 +111,11 @@ const {
 const {
   selectInputItemsForContinuation,
 } = await import(pathToFileURL(join(repoRoot, "src", "openai-ws-stream.ts")).href);
+const {
+  clearAllContinuationState,
+  getRemoteCompactionState,
+  setRemoteCompactionState,
+} = await import(pathToFileURL(join(repoRoot, "src", "state.ts")).href);
 
 const targetModelKey = "openai:openai-responses:gpt-5.4-nano";
 const reconstructed = reconstructRemoteCompactionStateFromBranch({
@@ -199,6 +205,247 @@ assert.match(reconstructedJson, /KEEP_REPLY_TWO/);
 assert.doesNotMatch(reconstructedJson, /DROP_ME/);
 assert.doesNotMatch(reconstructedJson, /DROP_REPLY/);
 
+// Regression: replacement history must use Pi's native conversion for every context-bearing
+// message kind, because the history replaces the provider input after compaction.
+const flattenedKinds = [
+  [{ role: "custom", customType: "subagent_result", content: "SUBAGENT_RESULT", display: false, timestamp: 0 }, /SUBAGENT_RESULT/],
+  [{ role: "custom", customType: "background_notification", content: "BG_NOTIFICATION", display: false, timestamp: 0 }, /BG_NOTIFICATION/],
+  [{ role: "custom", customType: "corrective", content: "CORRECTIVE_MESSAGE", display: false, timestamp: 0 }, /CORRECTIVE_MESSAGE/],
+  [{ role: "bashExecution", command: "echo hi", output: "BASH_OUTPUT_TEXT", exitCode: 0, cancelled: false, truncated: false, timestamp: 0 }, /BASH_OUTPUT_TEXT/],
+  [{ role: "branchSummary", summary: "BRANCH_SUMMARY_TEXT", fromId: "x", timestamp: 0 }, /BRANCH_SUMMARY_TEXT/],
+  [{ role: "compactionSummary", summary: "COMPACTION_SUMMARY_TEXT", tokensBefore: 1, timestamp: 0 }, /COMPACTION_SUMMARY_TEXT/],
+];
+for (const [message, marker] of flattenedKinds) {
+  const items = messageToResponseItems(message);
+  assert.ok(items.length > 0, `${message.role} message must not convert to zero response items`);
+  assert.equal(items[0].type, "message");
+  assert.equal(items[0].role, "user");
+  assert.match(JSON.stringify(items), marker);
+}
+
+assert.deepEqual(
+  messageToResponseItems({
+    role: "custom",
+    customType: "image-result",
+    content: [
+      { type: "text", text: "TEXT_WITH_IMAGE" },
+      { type: "image", data: "AAAA", mimeType: "image/png" },
+    ],
+    display: false,
+    timestamp: 0,
+  }),
+  [{
+    type: "message",
+    role: "user",
+    content: [
+      { type: "input_text", text: "TEXT_WITH_IMAGE" },
+      { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+    ],
+  }],
+ );
+assert.deepEqual(
+  messageToResponseItems({
+    role: "bashExecution",
+    command: "echo secret",
+    output: "EXCLUDED_BASH_OUTPUT",
+    exitCode: 0,
+    cancelled: false,
+    truncated: false,
+    excludeFromContext: true,
+    timestamp: 0,
+  }),
+  [],
+ );
+
+const trailingBranch = [
+  {
+    type: "compaction",
+    id: "cmp-2",
+    details: {
+      remoteCompaction: {
+        version: 2,
+        provider: "openai-responses-compaction",
+        implementation: "responses_compaction_v2",
+        modelKey: targetModelKey,
+        replacementHistory: [{ type: "compaction", encrypted_content: "ENCRYPTED_2" }],
+      },
+    },
+  },
+  {
+    type: "custom_message",
+    id: "custom-1",
+    customType: "supervision",
+    content: "INJECTED_EXTENSION_NOTE",
+    display: false,
+  },
+  {
+    type: "message",
+    id: "user-trailing",
+    message: { role: "user", content: [{ type: "text", text: "UNANSWERED_USER_TURN" }] },
+  },
+];
+const trailingState = reconstructRemoteCompactionStateFromBranch({ branchEntries: trailingBranch });
+assert.ok(trailingState, "expected reconstructed remote compaction state for trailing branch");
+const trailingJson = JSON.stringify(trailingState.explicitHistory);
+assert.match(trailingJson, /INJECTED_EXTENSION_NOTE/);
+assert.match(trailingJson, /UNANSWERED_USER_TURN/);
+assert.ok(trailingJson.indexOf("INJECTED_EXTENSION_NOTE") < trailingJson.indexOf("UNANSWERED_USER_TURN"));
+assert.equal((trailingJson.match(/INJECTED_EXTENSION_NOTE/g) ?? []).length, 1);
+const reloadedState = reconstructRemoteCompactionStateFromBranch({
+  branchEntries: JSON.parse(JSON.stringify(trailingBranch)),
+});
+assert.equal(
+  (JSON.stringify(reloadedState?.explicitHistory).match(/INJECTED_EXTENSION_NOTE/g) ?? []).length,
+  1,
+  "reloading the same branch must not duplicate persisted custom context",
+ );
+const registeredHandlers = new Map();
+extensionFactory({
+  registerProvider() {},
+  on(event, handler) {
+    registeredHandlers.set(event, handler);
+  },
+  getAllTools: () => [],
+  getActiveTools: () => [],
+  getThinkingLevel: () => "low",
+});
+const liveSessionId = "live-custom-message-session";
+const liveModel = {
+  provider: "openai-codex",
+  api: "openai-codex-responses",
+  id: "gpt-5.4",
+  baseUrl: "https://chatgpt.com/backend-api",
+  input: ["text"],
+};
+const liveModelKey = "openai-codex:openai-codex-responses:gpt-5.4";
+const liveReplacementHistory = [{ type: "compaction", encrypted_content: "LIVE_ENCRYPTED" }];
+const liveBranch = [
+  {
+    type: "compaction",
+    id: "live-compaction",
+    details: {
+      remoteCompaction: {
+        version: 2,
+        provider: "openai-responses-compaction",
+        implementation: "responses_compaction_v2",
+        modelKey: liveModelKey,
+        replacementHistory: liveReplacementHistory,
+      },
+    },
+  },
+  {
+    type: "custom_message",
+    id: "idle-custom-result",
+    customType: "supervised-fork-result",
+    content: "LIVE_IDLE_CUSTOM_RESULT",
+    display: true,
+  },
+];
+const liveContext = {
+  cwd: repoRoot,
+  model: liveModel,
+  hasUI: false,
+  ui: { notify() {} },
+  sessionManager: {
+    getSessionId: () => liveSessionId,
+    getBranch: () => liveBranch,
+  },
+};
+const messageEnd = registeredHandlers.get("message_end");
+assert.equal(typeof messageEnd, "function");
+setRemoteCompactionState(liveSessionId, {
+  compactionEntryId: "live-compaction",
+  modelKey: liveModelKey,
+  replacementHistory: liveReplacementHistory,
+  explicitHistory: liveReplacementHistory,
+});
+messageEnd({
+  message: {
+    role: "custom",
+    customType: "subagent_result",
+    content: "LIVE_MESSAGE_END_RESULT",
+    display: false,
+    timestamp: 0,
+  },
+}, liveContext);
+assert.match(
+  JSON.stringify(getRemoteCompactionState(liveSessionId)?.explicitHistory),
+  /LIVE_MESSAGE_END_RESULT/,
+  "a live custom completion must enter replacement history",
+ );
+const beforeProviderRequest = registeredHandlers.get("before_provider_request");
+assert.equal(typeof beforeProviderRequest, "function");
+process.env.PI_OPENAI_SERVER_COMPACTION_ENABLED = "true";
+setRemoteCompactionState(liveSessionId, {
+  compactionEntryId: "live-compaction",
+  modelKey: liveModelKey,
+  replacementHistory: liveReplacementHistory,
+  explicitHistory: liveReplacementHistory,
+});
+const livePatchedPayload = await beforeProviderRequest(
+  { payload: { model: "gpt-5.4", input: [] } },
+  {
+    cwd: repoRoot,
+    model: liveModel,
+    hasUI: false,
+    ui: { notify() {} },
+    sessionManager: {
+      getSessionId: () => liveSessionId,
+      getBranch: () => liveBranch,
+    },
+  },
+ );
+assert.match(
+  JSON.stringify(livePatchedPayload?.input),
+  /LIVE_IDLE_CUSTOM_RESULT/,
+  "idle persisted custom context must enter live replacement history",
+ );
+
+// The pre-compaction hook must reconcile the same branch before creating a new history.
+setRemoteCompactionState(liveSessionId, {
+  compactionEntryId: "live-compaction",
+  modelKey: liveModelKey,
+  replacementHistory: liveReplacementHistory,
+  explicitHistory: liveReplacementHistory,
+});
+const compactController = new AbortController();
+compactController.abort();
+const beforeCompact = registeredHandlers.get("session_before_compact");
+assert.equal(typeof beforeCompact, "function");
+await beforeCompact(
+  {
+    branchEntries: liveBranch,
+    preparation: {
+      firstKeptEntryId: "idle-custom-result",
+      tokensBefore: 1,
+      messagesToSummarize: [],
+      messagesToKeep: [],
+    },
+    customInstructions: undefined,
+    signal: compactController.signal,
+  },
+  {
+    cwd: repoRoot,
+    model: liveModel,
+    hasUI: false,
+    ui: { notify() {} },
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: undefined }),
+    },
+    getSystemPrompt: () => "system",
+    sessionManager: {
+      getSessionId: () => liveSessionId,
+      getBranch: () => liveBranch,
+    },
+  },
+ );
+assert.match(
+  JSON.stringify(getRemoteCompactionState(liveSessionId)?.explicitHistory),
+  /LIVE_IDLE_CUSTOM_RESULT/,
+  "pre-compaction reconciliation must retain idle custom context",
+ );
+clearAllContinuationState();
+delete process.env.PI_OPENAI_SERVER_COMPACTION_ENABLED;
 const requestBody = buildRemoteCompactionRequestBody({
   model: {
     id: "gpt-5.4-nano",

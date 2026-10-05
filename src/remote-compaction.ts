@@ -355,6 +355,17 @@ function buildPortableSummaryPrompt(conversation: string, customInstructions?: s
   return `Summarize this conversation for future continuation in pi. Preserve goals, decisions, important facts, file paths, open questions, and next steps. Be concise but include information needed to continue work.${instructionSuffix}\n\n<conversation>\n${conversation}\n</conversation>`;
 }
 
+/**
+ * Pi flattens non-LLM context messages through its native converter before sending them
+ * to a provider. Mirror that conversion here so replacement history stays equivalent to
+ * Pi's context, including extension messages, shell output, and summaries.
+ */
+function nonLlmMessageToUserContent(message: AgentMessage): ResponseContentItem[] {
+  const [flattened] = convertToLlm([message]);
+  if (!flattened || flattened.role !== "user") return [];
+  return contentToResponseContentItems(flattened.content);
+}
+
 export function messageToResponseItems(message: AgentMessage): ResponseItem[] {
   const items: ResponseItem[] = [];
 
@@ -417,6 +428,12 @@ export function messageToResponseItems(message: AgentMessage): ResponseItem[] {
       call_id: message.toolCallId.split("|", 1)[0],
       output: toolResultContentToOutput(message.content),
     });
+    return items;
+  }
+
+  const flattened = nonLlmMessageToUserContent(message);
+  if (flattened.length > 0) {
+    items.push({ type: "message", role: "user", content: flattened });
   }
 
   return items;
@@ -1027,6 +1044,48 @@ function assistantMessageMatchesModelKey(
   return message.provider === target.provider && message.model === target.id;
 }
 
+/**
+ * Convert branch entries that contribute to Pi's model context into AgentMessage values.
+ * Extension messages are persisted as `custom_message` entries rather than `message` entries,
+ * so reconstruction must account for both shapes before using the native converter.
+ */
+export function branchEntryToContextMessage(entry: {
+  type: string;
+  message?: unknown;
+  customType?: unknown;
+  content?: unknown;
+  display?: unknown;
+  details?: unknown;
+  summary?: unknown;
+  fromId?: unknown;
+}): AgentMessage | undefined {
+  if (entry.type === "message") {
+    return entry.message ? (entry.message as AgentMessage) : undefined;
+  }
+
+  if (entry.type === "custom_message") {
+    return {
+      role: "custom",
+      customType: typeof entry.customType === "string" ? entry.customType : "",
+      content: typeof entry.content === "string" || Array.isArray(entry.content) ? entry.content : [],
+      display: entry.display !== false,
+      ...(entry.details !== undefined ? { details: entry.details } : {}),
+      timestamp: Date.now(),
+    } as unknown as AgentMessage;
+  }
+
+  if (entry.type === "branch_summary" && typeof entry.summary === "string" && entry.summary) {
+    return {
+      role: "branchSummary",
+      summary: entry.summary,
+      fromId: typeof entry.fromId === "string" ? entry.fromId : "",
+      timestamp: Date.now(),
+    } as unknown as AgentMessage;
+  }
+
+  return undefined;
+}
+
 export function reconstructRemoteCompactionStateFromBranch(params: {
   branchEntries: Array<{ type: string; id: string; details?: unknown; message?: AgentMessage }>;
 }): RemoteCompactionSessionState | undefined {
@@ -1047,13 +1106,14 @@ export function reconstructRemoteCompactionStateFromBranch(params: {
   let pendingTurnItems: ResponseItem[] = [];
 
   for (const entry of params.branchEntries.slice(latestCompactionIndex + 1)) {
-    if (entry.type !== "message" || !entry.message) continue;
+    const message = branchEntryToContextMessage(entry);
+    if (!message) continue;
 
-    const items = messageToResponseItems(entry.message);
+    const items = messageToResponseItems(message);
     if (items.length === 0) continue;
 
-    if (entry.message.role === "assistant") {
-      if (assistantMessageMatchesModelKey(entry.message, latestDetails.modelKey)) {
+    if (message.role === "assistant") {
+      if (assistantMessageMatchesModelKey(message, latestDetails.modelKey)) {
         trailingMessages.push(...pendingTurnItems, ...items);
       }
       pendingTurnItems = [];
@@ -1063,6 +1123,9 @@ export function reconstructRemoteCompactionStateFromBranch(params: {
     pendingTurnItems.push(...items);
   }
 
+  // Preserve an unanswered trailing turn, including extension messages persisted without
+  // a matching assistant response or message_end callback.
+  trailingMessages.push(...pendingTurnItems);
   return {
     compactionEntryId: latestCompactionEntryId,
     modelKey: latestDetails.modelKey,
