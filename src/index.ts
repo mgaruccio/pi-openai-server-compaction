@@ -347,6 +347,7 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
       const payload = applyRemoteHistoryPayloadPatch({
         payload: event.payload,
         explicitHistory: normalizeResponseItemsForPrompt(remoteState.explicitHistory, model) as unknown[],
+        callableTools: buildToolsPayload(pi.getAllTools(), pi.getActiveTools()),
       });
       maybeNotifyRequestFeatures({
         notifiedModels,

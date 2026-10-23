@@ -3,6 +3,7 @@
 This changelog intentionally starts at **0.1.0**.
 
 ## Unreleased
+- keep Codex callable tools when remote compaction replaces request input: replay preserves `additional_tools`, and active tools are reattached when the payload has neither those items nor a top-level `tools` array
 - target Pi 0.80.9 and the `@earendil-works/*` package namespace
 - align compaction fallback, Responses payload normalization, Codex identity headers, and WebSocket behavior with Pi 0.80.9
 - replace the legacy `/responses/compact` call with Codex's current Responses compaction v2 protocol

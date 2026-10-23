@@ -108,6 +108,7 @@ const {
   reconstructRemoteCompactionStateFromBranch,
   remoteCompactionV2EndpointUrl,
 } = await import(pathToFileURL(join(repoRoot, "src", "remote-compaction.ts")).href);
+const { applyRemoteHistoryPayloadPatch } = await import(pathToFileURL(join(repoRoot, "src", "openai.ts")).href);
 const {
   selectInputItemsForContinuation,
 } = await import(pathToFileURL(join(repoRoot, "src", "openai-ws-stream.ts")).href);
@@ -400,6 +401,50 @@ assert.match(
   /LIVE_IDLE_CUSTOM_RESULT/,
   "idle persisted custom context must enter live replacement history",
  );
+const codexToolPayload = await beforeProviderRequest(
+  {
+    payload: {
+      model: "gpt-5.4",
+      input: [
+        {
+          type: "additional_tools",
+          role: "developer",
+          tools: [{ type: "function", name: "bg_logs", parameters: { type: "object" } }],
+        },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "STALE_TOOL_INPUT" }] },
+      ],
+    },
+  },
+  {
+    cwd: repoRoot,
+    model: liveModel,
+    hasUI: false,
+    ui: { notify() {} },
+    sessionManager: {
+      getSessionId: () => liveSessionId,
+      getBranch: () => liveBranch,
+    },
+  },
+);
+const codexToolInput = JSON.stringify(codexToolPayload?.input);
+assert.match(codexToolInput, /"name":"bg_logs"/, "Codex remote replay must keep additional_tools callable");
+assert.match(codexToolInput, /LIVE_IDLE_CUSTOM_RESULT/);
+assert.doesNotMatch(codexToolInput, /STALE_TOOL_INPUT/);
+assert.equal(codexToolPayload?.input?.[0]?.type, "additional_tools");
+const injectedToolPayload = applyRemoteHistoryPayloadPatch({
+  payload: {
+    model: "gpt-6-astra",
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "DELTA" }] }],
+    previous_response_id: "STALE_PREVIOUS_RESPONSE_ID",
+  },
+  explicitHistory: [{ type: "compaction", encrypted_content: "ENC" }],
+  callableTools: [{ type: "function", name: "bash", parameters: { type: "object" } }],
+});
+assert.equal(injectedToolPayload.input[0]?.type, "additional_tools");
+assert.equal(injectedToolPayload.input[0]?.tools?.[0]?.name, "bash");
+assert.equal(injectedToolPayload.input[1]?.type, "compaction");
+assert.equal(injectedToolPayload.previous_response_id, undefined);
+assert.doesNotMatch(JSON.stringify(injectedToolPayload.input), /DELTA/);
 
 // Regression: the direct OpenAI HTTP fallback can build a stale input snapshot before
 // before_provider_request runs. The final hook must replace that input from the reconciled branch,

@@ -25,6 +25,7 @@ import {
 import { streamSimpleOpenAIResponses } from "@earendil-works/pi-ai/compat";
 import { loadConfig } from "./config.ts";
 import {
+  applyRemoteHistoryPayloadPatch,
   isDirectOpenAIResponsesModel,
   modelKey,
   thinkingLevelToResponsesReasoning,
@@ -737,9 +738,13 @@ async function fallbackToHttp(
       if (payload && typeof payload === "object") {
         const payloadObj = { ...(payload as Record<string, unknown>) };
         if (remoteCompactionState && remoteCompactionState.modelKey === modelKey(model)) {
-          payloadObj.input = normalizeResponseItemsForPrompt(remoteCompactionState.explicitHistory, model) as unknown[];
-          delete payloadObj.previous_response_id;
-          nextPayload = payloadObj;
+          nextPayload = applyRemoteHistoryPayloadPatch({
+            payload: payloadObj,
+            explicitHistory: normalizeResponseItemsForPrompt(
+              remoteCompactionState.explicitHistory,
+              model,
+            ) as unknown[],
+          });
         } else if (
           typeof payloadObj.previous_response_id === "string" &&
           continuationState?.modelKey === modelKey(model) &&

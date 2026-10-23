@@ -152,13 +152,48 @@ export function thinkingLevelToResponsesReasoning(
   return undefined;
 }
 
+function isAdditionalToolsItem(item: unknown): item is { type: "additional_tools"; tools: unknown[] } {
+  return isRecord(item) && item.type === "additional_tools" && Array.isArray(item.tools);
+}
+
+function inputHasAdditionalTools(input: unknown[]): boolean {
+  return input.some(isAdditionalToolsItem);
+}
+
+/**
+ * Codex declares callable tools as `additional_tools` input items and leaves the
+ * top-level `tools` array empty. Remote replay replaces `input`, so those items
+ * must be copied onto the replacement history or the host has no callable tools.
+ */
+export function prependMissingAdditionalTools(history: unknown[], sourceInput: unknown): unknown[] {
+  if (!Array.isArray(sourceInput)) return history;
+  const declarations = sourceInput.filter(isAdditionalToolsItem);
+  if (declarations.length === 0) return history;
+  const present = new Set(
+    history.filter(isAdditionalToolsItem).map((item) => JSON.stringify(item.tools)),
+  );
+  const missing = declarations.filter((item) => !present.has(JSON.stringify(item.tools)));
+  return missing.length === 0 ? history : [...missing, ...history];
+}
+
 export function applyRemoteHistoryPayloadPatch(params: {
   payload: JsonRecord;
   explicitHistory: unknown[];
+  callableTools?: Record<string, unknown>[];
 }): JsonRecord {
+  let input = prependMissingAdditionalTools(params.explicitHistory, params.payload.input);
+  const hasTopLevelTools = Array.isArray(params.payload.tools) && params.payload.tools.length > 0;
+  if (
+    !hasTopLevelTools &&
+    !inputHasAdditionalTools(input) &&
+    params.callableTools !== undefined &&
+    params.callableTools.length > 0
+  ) {
+    input = [{ type: "additional_tools", role: "developer", tools: params.callableTools }, ...input];
+  }
   const nextPayload: JsonRecord = {
     ...params.payload,
-    input: params.explicitHistory,
+    input,
   };
   delete nextPayload.messages;
   delete nextPayload.previous_response_id;
